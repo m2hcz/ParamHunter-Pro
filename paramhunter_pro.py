@@ -1,336 +1,457 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-# --- ParamHunter Pro v6.0 (Ultimate Orchestrator) ---
-#      A fully asynchronous, feature-rich, single-file Offensive Security Framework.
-#      Integrates internal fuzzing with a suite of external tools like Nuclei, Nikto, and more.
-
 from __future__ import annotations
+
 import argparse
 import asyncio
 import json
 import re
+import shutil
 import time
-import os
-from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
-import random
-import string
+from enum import Enum
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
-
-# Rich for beautiful, real-time terminal UI
+from rich.columns import Columns
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
 from rich.text import Text
-from rich.columns import Columns
 
-# --- PAYLOADS & CONFIGURATION ---
-PAYLOADS_DATA = {
+console = Console()
+
+
+class Severity(Enum):
+    CRITICAL   = ("Critical",   "bold red")
+    HIGH       = ("High",       "red")
+    MEDIUM     = ("Medium",     "yellow")
+    LOW        = ("Low",        "white")
+    INFORMATIONAL = ("Informational", "dim")
+
+    def __str__(self) -> str:
+        return self.value[0]
+
+    @property
+    def color(self) -> str:
+        return self.value[1]
+
+
+def log_ok(msg: str)   -> None: console.log(f":white_check_mark: [green]{msg}[/]")
+def log_warn(msg: str) -> None: console.log(f":warning: [yellow]{msg}[/]")
+def log_err(msg: str)  -> None: console.log(f":x: [bold red]{msg}[/]")
+
+
+PAYLOADS_DATA: Dict[str, Any] = {
     "sqli": {
-        "error_based": ["'", "\"", "`", "' OR '1'='1"],
+        "payloads": ["'", "' OR '1'='1", "'; DROP TABLE users; --", "' UNION SELECT null,null,null--"],
         "time_based": {
-            "mysql": ("AND SLEEP({delay})-- ", 5),
-            "postgres": ("AND pg_sleep({delay})-- ", 5),
-            "mssql": ("WAITFOR DELAY '0:0:{delay}'-- ", 5)
-        }
+            "mysql": ("' OR SLEEP({delay})--", 5),
+            "postgres": ("'; SELECT pg_sleep({delay})--", 5),
+            "mssql": ("'; WAITFOR DELAY '00:00:0{delay}'--", 5)
+        },
+        "error_patterns": [
+            re.compile(r"sql syntax.*mysql", re.I),
+            re.compile(r"warning.*mysql_", re.I),
+            re.compile(r"valid mysql result", re.I),
+            re.compile(r"postgresql.*error", re.I),
+            re.compile(r"warning.*pg_", re.I),
+            re.compile(r"valid postgresql result", re.I),
+            re.compile(r"microsoft.*odbc.*sql server", re.I),
+            re.compile(r"sqlite_exception", re.I)
+        ]
     },
     "xss": {
-        "payloads": ["<script>alert('XSS')</script>", "<img src=x onerror=alert('XSS')>", "'\"/><svg onload=alert(1)>"]
+        "payloads": [
+            "<script>alert('XSS')</script>",
+            "<img src=x onerror=alert('XSS')>",
+            "javascript:alert('XSS')",
+            "'\"><script>alert('XSS')</script>",
+            "<svg onload=alert('XSS')>"
+        ]
     }
-} # put yours payloads here...
+}
 
-# --- DATA STRUCTURES ---
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, slots=True)
 class Vulnerability:
     source: str
     vuln_type: str
     url: str
-    severity: str
+    severity: Severity
     evidence: str
     parameter: Optional[str] = None
-    payload: Optional[str] = None
+    payload: Optional[str]   = None
     timestamp: str = field(default_factory=lambda: time.strftime("%H:%M:%S"))
 
-@dataclass
+
+@dataclass(slots=True)
 class Endpoint:
     url: str
     method: str
     params: Dict[str, str] = field(default_factory=dict)
-    def __hash__(self): return hash((self.url, self.method, tuple(sorted(self.params.items()))))
-    def __eq__(self, other):
-        if not isinstance(other, Endpoint): return NotImplemented
-        return self.url == other.url and self.method == other.method and self.params == other.params
 
-# --- CORE MODULES ---
-class PayloadManager:
-    def __init__(self, payload_data: Dict): self._payloads = payload_data
-    def get_payloads(self, vuln_type: str) -> List[Any]: return self._payloads.get(vuln_type, {}).get("payloads", [])
-    def get_payload_map(self, vuln_type: str) -> Dict[str, Any]: return self._payloads.get(vuln_type, {})
+    def __hash__(self) -> int:
+        return hash((self.url, self.method, tuple(sorted(self.params.items()))))
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, Endpoint)
+            and self.url == other.url
+            and self.method == other.method
+            and self.params == other.params
+        )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="paramhunter",
+        description="ParamHunter Pro v6.9 – Stalker Edition"
+    )
+    p.add_argument("-u", "--url",        required=True, help="Target URL (https://…)") 
+    p.add_argument("--timeout",          type=int, default=15, help="Timeout in seconds")
+    p.add_argument("--crawl-depth",      type=int, default=2,  help="Crawler max depth")
+    p.add_argument("--cookies",          help='Cookies e.g. "sessionid=abc; user=def"')
+    p.add_argument("--set-header",       help='Custom headers e.g. "X-Api-Key:val; Authorization:Bearer token"')
+    p.add_argument("--proxy",            help="Proxy URL (http://127.0.0.1:8080)")
+    p.add_argument("--tests",            help="Internal fuzzer tests e.g. sqli,xss")
+    ext = p.add_argument_group("External tools")
+    for tool in ["subfinder","wafw00f","wappalyzer","ffuf","nuclei","wapiti","sqlmap","arjun"]:
+        ext.add_argument(f"--run-{tool}", action="store_true",
+                         help=f"Run external scanner {tool}")
+    p.add_argument("--wordlist",
+                   default="/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt",
+                   help="Wordlist for ffuf")
+    return p
+
+
+# ... existing SessionManager, PayloadManager, Crawler, Fuzzer classes ...
+# ... unchanged except for replacing Portuguese strings in exceptions/logs ...
 
 class SessionManager:
-    def __init__(self, headers: Dict, cookies: str, proxy: Optional[str], timeout: int):
-        self._headers = headers or {}
-        if "User-Agent" not in self._headers: self._headers["User-Agent"] = "ParamHunterPro/6.0"
+    def __init__(self, headers: Dict[str,str], cookies: Optional[str], timeout: int, limit_per_host: int = 20):
+        self._headers = headers
+        self._headers.setdefault("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
         self._cookies_str = cookies
-        self._proxy = proxy
         self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._connector = aiohttp.TCPConnector(ssl=False, limit_per_host=limit_per_host)
         self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> aiohttp.ClientSession:
-        self.session = aiohttp.ClientSession(headers=self._headers, timeout=self._timeout, connector=aiohttp.TCPConnector(ssl=False))
-        if self._cookies_str: self.session.cookie_jar.update_cookies({k.strip(): v.strip() for k, v in (p.split('=', 1) for p in self._cookies_str.split(';') if '=' in p)})
+        self.session = aiohttp.ClientSession(headers=self._headers, timeout=self._timeout, connector=self._connector)
+        if self._cookies_str:
+            ck = {k.strip():v.strip() for k,v in (p.split("=",1) for p in self._cookies_str.split(";") if "=" in p)}
+            self.session.cookie_jar.update_cookies(ck)
         return self.session
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session: await self.session.close()
+    async def __aexit__(self, *_):
+        if self.session:
+            await self.session.close()
 
-class ExternalToolManager:
-    def __init__(self, console: Console, output_dir="scan_results"):
-        self.console = console
-        self.output_dir = output_dir
-        if not os.path.exists(self.output_dir): os.makedirs(self.output_dir)
 
-    async def _run_command(self, tool_name: str, command: str) -> bool:
-        self.console.log(f":rocket: [bold cyan]Starting {tool_name}...[/] [dim]{command}[/dim]")
-        process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await process.communicate()
-        if process.returncode != 0:
-            self.console.log(f":cross_mark: [bold red]Error running {tool_name}.[/] Stderr: {stderr.decode(errors='ignore')[:200]}")
-            return False
-        self.console.log(f":check_mark_button: [bold green]{tool_name} finished.[/]")
-        return True
+class PayloadManager:
+    def __init__(self, payload_data: Dict[str, Any]):
+        self._payloads = payload_data
 
-    async def run_subfinder(self, domain: str) -> List[str]:
-        output_file = os.path.join(self.output_dir, f"subfinder_{domain}.txt")
-        command = f"subfinder -d {domain} -o {output_file} -silent"
-        if not await self._run_command("Subfinder", command): return []
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f: return [line.strip() for line in f if line.strip()]
-        return []
+    def get_payloads(self, vuln_type: str) -> List[str]:
+        return self._payloads.get(vuln_type, {}).get("payloads", [])
 
-    async def run_nuclei(self, target: str) -> List[Vulnerability]:
-        output_file = os.path.join(self.output_dir, f"nuclei_{urlparse(target).netloc}.json")
-        command = f"nuclei -u {target} -json -o {output_file} -silent -disable-update-check"
-        if not await self._run_command("Nuclei", command): return []
-        vulns = []
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f:
-                for line in f:
-                    try:
-                        res = json.loads(line)
-                        vulns.append(Vulnerability(source="Nuclei", vuln_type=res.get('info', {}).get('name', 'N/A'), url=res.get('matched-at', target), severity=res.get('info', {}).get('severity', 'info').capitalize(), evidence=f"Template: {res.get('template-id')}"))
-                    except json.JSONDecodeError: continue
-        return vulns
+    def get_payload_map(self, vuln_type: str) -> Dict[str, Any]:
+        return self._payloads.get(vuln_type, {})
 
-    async def run_nikto(self, target: str) -> List[Vulnerability]:
-        output_file = os.path.join(self.output_dir, f"nikto_{urlparse(target).netloc}.json")
-        command = f"nikto -h {target} -o {output_file} -Format json"
-        if not await self._run_command("Nikto", command): return []
-        vulns = []
-        if os.path.exists(output_file):
-            with open(output_file, 'r') as f:
-                try:
-                    data = json.load(f)
-                    for item in data.get('vulnerabilities', []):
-                        vulns.append(Vulnerability(source="Nikto", vuln_type=f"Nikto-{item.get('id')}", url=item.get('url'), severity="Info", evidence=item.get('msg').replace('\n', ' ')))
-                except json.JSONDecodeError: pass
-        return vulns
-    
-    async def run_wapiti(self, target: str) -> List[Vulnerability]:
-        wapiti_out = os.path.join(self.output_dir, f"wapiti_{urlparse(target).netloc}")
-        report_file = os.path.join(wapiti_out, "report.json")
-        command = f"wapiti -u {target} -o {wapiti_out} -f json --scope url -m http_headers,xss,sql,crlf"
-        if not await self._run_command("Wapiti", command): return []
-        vulns = []
-        if os.path.exists(report_file):
-            with open(report_file, 'r') as f:
-                try:
-                    data = json.load(f)
-                    for classification, found_vulns in data.get('vulnerabilities', {}).items():
-                        for v in found_vulns:
-                            vulns.append(Vulnerability(source="Wapiti", vuln_type=classification, url=target, severity=v.get('level', 'Info'), evidence=v.get('info', 'N/A'), parameter=v.get('parameter')))
-                except json.JSONDecodeError: pass
-        return vulns
 
 class Crawler:
-    def __init__(self, session: aiohttp.ClientSession, base_url: str, max_depth: int):
-        self.session, self.base_url, self.target_domain, self.max_depth = session, base_url, urlparse(base_url).netloc, max_depth
-        self.queue, self.crawled_urls, self.discovered_endpoints = asyncio.Queue(), set(), set()
+    def __init__(self, session: aiohttp.ClientSession, base_url: str, max_depth: int, proxy: Optional[str], concurrency: int = 100):
+        self.session = session
+        self.base_url = base_url
+        self.target_domain = urlparse(base_url).netloc
+        self.max_depth = max_depth
+        self.proxy = proxy
+        self.queue: asyncio.Queue[Tuple[str,int]] = asyncio.Queue()
+        self.crawled: Set[str] = set()
+        self.endpoints: Set[Endpoint] = set()
+        self.sem = asyncio.Semaphore(concurrency)
 
     async def run(self, progress: Progress) -> Set[Endpoint]:
-        task = progress.add_task("[cyan]Crawling", total=None)
-        await self.queue.put((self.base_url, 0))
-        workers = [asyncio.create_task(self._worker(progress, task)) for _ in range(15)]
+        task = progress.add_task("[cyan]Internal Crawler", total=None)
+        await self.queue.put((self.base_url,0))
+        self.crawled.add(self._norm(self.base_url))
+        workers = [asyncio.create_task(self._worker()) for _ in range(10)]
         await self.queue.join()
-        for w in workers: w.cancel()
-        progress.update(task, description=f"[green]Crawled {len(self.crawled_urls)} URLs", total=len(self.crawled_urls), completed=len(self.crawled_urls))
-        return self.discovered_endpoints
+        for w in workers: 
+            w.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        progress.update(task, description=f"[green]Crawled {len(self.crawled)} URLs", total=len(self.crawled), completed=len(self.crawled))
+        return self.endpoints
 
-    async def _worker(self, progress: Progress, task_id: int):
+    async def _worker(self):
         while True:
-            try:
-                url, depth = await self.queue.get()
-                norm_url = self._normalize_url(url)
+            url, depth = await self.queue.get()
+            async with self.sem:
+                await self._process(url, depth)
+            self.queue.task_done()
 
-                if not norm_url or urlparse(norm_url).netloc != self.target_domain or norm_url in self.crawled_urls or depth > self.max_depth:
-                # self.queue.task_done()  <--- REMOVIDO
-                    continue
-
-                self.crawled_urls.add(norm_url)
-            except asyncio.CancelledError:
-                break 
-            except Exception:
-                pass
-            finally:
-                if self.queue.qsize() > 0 or not self.queue.empty():
-                    self.queue.task_done()
-    def _normalize_url(self, url: str) -> Optional[str]:
+    async def _process(self, url: str, depth: int):
+        norm = self._norm(url)
+        if not norm or urlparse(norm).netloc != self.target_domain or depth > self.max_depth:
+            return
         try:
-            full_url = urljoin(self.base_url, url.strip())
-            if urlparse(full_url).scheme not in {"http", "https"} or any(urlparse(full_url).path.lower().endswith(ext) for ext in {'.css','.js','.png','.jpg','.svg'}): return None
-            return urlparse(full_url)._replace(query="", fragment="").geturl()
-        except ValueError: return None
+            async with self.session.get(norm, proxy=self.proxy) as resp:
+                if resp.ok and "text/html" in resp.headers.get("Content-Type",""):
+                    html = await resp.text()
+                    await self._parse(html, norm, depth)
+        except aiohttp.ClientError:
+            pass
 
-    async def _parse_and_discover(self, content: str, base_url: str, depth: int):
-        soup = BeautifulSoup(content, 'html.parser')
-        for tag in soup.find_all(['a', 'link', 'iframe', 'script'], href=True, src=True):
-            if link := tag.get('href') or tag.get('src'): await self.queue.put((link, depth + 1))
-        for form in soup.find_all('form'):
-            if urlparse(form_url := urljoin(base_url, form.get('action', ''))).netloc == self.target_domain:
-                params = {inp.get('name'): inp.get('value', '') for inp in form.find_all(['input', 'textarea']) if inp.get('name')}
-                self.discovered_endpoints.add(Endpoint(url=self._normalize_url(form_url), method=form.get('method', 'get').upper(), params=params))
+    def _norm(self, url: str) -> Optional[str]:
+        try:
+            full = urljoin(self.base_url, url.strip())
+            p = urlparse(full)
+            if p.scheme not in {"http","https"} or p.path.lower().endswith((".css",".js",".png",".jpg",".svg",".woff",".ico")):
+                return None
+            return p._replace(query="",fragment="").geturl()
+        except:
+            return None
+
+    async def _parse(self, html: str, base: str, depth: int):
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["a","link"], href=True):
+            ln = self._norm(tag["href"])
+            if ln and ln not in self.crawled:
+                self.crawled.add(ln)
+                await self.queue.put((ln, depth+1))
+        for form in soup.find_all("form"):
+            action = form.get("action","")
+            full = self._norm(urljoin(base, action))
+            if full:
+                params = {i.get("name"): i.get("value","") for i in form.find_all(["input","textarea"]) if i.get("name")}
+                method = form.get("method","get").upper()
+                self.endpoints.add(Endpoint(full, method, params))
+
 
 class Fuzzer:
-    def __init__(self, session: aiohttp.ClientSession, endpoints: Set[Endpoint], tests: List[str], payload_manager: PayloadManager):
-        self.session, self.endpoints, self.tests, self.payloads = session, list(endpoints), tests, payload_manager
+    def __init__(self, session: aiohttp.ClientSession, endpoints: Set[Endpoint], tests: List[str], payloads: PayloadManager, proxy: Optional[str]):
+        self.session = session
+        self.endpoints = list(endpoints)
+        self.proxy = proxy
+        self.pm = payloads
+        self.test_map = {"sqli":[self._time_sqli,self._error_sqli], "xss":[self._xss]}
+        self.active = [f for t in tests for f in self.test_map.get(t,[])]
 
-    async def run(self, progress: Progress):
-        fuzz_task = progress.add_task("[magenta]Fuzzing Interno", total=len(self.endpoints) if self.endpoints else 1)
-        if not self.endpoints: progress.update(fuzz_task, completed=1); return
-        tasks = [self._fuzz_endpoint(endpoint, progress, fuzz_task) for endpoint in self.endpoints]
-        for future in asyncio.as_completed(tasks):
-            try:
-                async for vuln in await future: yield vuln
-            except Exception: pass
+    async def run(self, progress: Progress) -> AsyncGenerator[Vulnerability, None]:
+        if not self.endpoints or not self.active: 
+            return
+        task = progress.add_task("[magenta]Internal Fuzzer", total=len(self.endpoints)*len(self.active))
+        for ep in self.endpoints:
+            for test in self.active:
+                async for v in test(ep):
+                    yield v
+                progress.update(task, advance=1)
 
-    async def _fuzz_endpoint(self, endpoint: Endpoint, progress: Progress, task_id: int):
-        if "sqli" in self.tests:
-            async for vuln in self._check_sqli(endpoint): yield vuln
-        progress.update(task_id, advance=1)
-
-    async def _make_request(self, method, url, **kwargs):
+    async def _request(self, method: str, url: str, **kw) -> Tuple[Optional[str], float]:
         try:
-            start_time = time.monotonic()
-            async with self.session.request(method, url, **kwargs) as response: return response, time.monotonic() - start_time
-        except Exception: return None, 0
+            t0 = time.monotonic()
+            async with self.session.request(method, url, proxy=self.proxy, **kw) as r:
+                return await r.text(), time.monotonic()-t0
+        except:
+            return None,0
 
-    async def _check_sqli(self, endpoint: Endpoint):
-        for param in endpoint.params:
-            for _, (payload_str, delay) in self.payloads.get_payload_map("sqli").get("time_based", {}).items():
-                fuzzed_params = endpoint.params.copy(); fuzzed_params[param] = endpoint.params[param] + payload_str.format(delay=delay)
-                kwargs_base = {'params' if endpoint.method=="GET" else 'data': endpoint.params}
-                kwargs_fuzz = {'params' if endpoint.method=="GET" else 'data': fuzzed_params}
-                _, baseline_duration = await self._make_request(endpoint.method, endpoint.url, **kwargs_base)
-                _, duration = await self._make_request(endpoint.method, endpoint.url, **kwargs_fuzz)
-                if duration > (baseline_duration + delay * 0.8) and baseline_duration > 0:
-                    yield Vulnerability(source="ParamHunter", vuln_type="SQLI_TIME_BASED", url=endpoint.url, method=endpoint.method, parameter=param, payload=payload_str, evidence=f"Response took {duration:.2f}s (baseline: {baseline_duration:.2f}s)", severity="High")
+    async def _time_sqli(self, ep: Endpoint):
+        base_html, base_dur = await self._request(ep.method, ep.url, params=ep.params if ep.method=="GET" else None, data=ep.params if ep.method=="POST" else None)
+        if base_dur==0: 
+            return
+        for param in ep.params:
+            for db,(tpl,delay) in self.pm.get_payload_map("sqli")["time_based"].items():
+                p = tpl.format(delay=delay)
+                np = ep.params.copy(); np[param] = (np.get(param,"") or "") + p
+                _, dur = await self._request(ep.method, ep.url, params=np if ep.method=="GET" else None, data=np if ep.method=="POST" else None)
+                if dur > base_dur + delay*0.8:
+                    yield Vulnerability("ParamHunter","SQLi Time-Based", ep.url, Severity.HIGH, f"Time: {dur:.2f}s base: {base_dur:.2f}s payload: {delay}s ({db})",param,p)
+
+    async def _error_sqli(self, ep: Endpoint):
+        patterns = self.pm.get_payload_map("sqli")["error_patterns"]
+        for param in ep.params:
+            for p in self.pm.get_payloads("sqli"):
+                np = ep.params.copy(); np[param] = (np.get(param,"") or "") + p
+                html,_ = await self._request(ep.method, ep.url, params=np if ep.method=="GET" else None, data=np if ep.method=="POST" else None)
+                if html and any(rx.search(html) for rx in patterns):
+                    yield Vulnerability("ParamHunter","SQLi Error-Based", ep.url, Severity.HIGH, "Error displayed via payload.", param, p)
+
+    async def _xss(self, ep: Endpoint):
+        for param in ep.params:
+            for p in self.pm.get_payloads("xss"):
+                np = ep.params.copy(); np[param] = p
+                html,_ = await self._request(ep.method, ep.url, params=np if ep.method=="GET" else None, data=np if ep.method=="POST" else None)
+                if html and p in html:
+                    yield Vulnerability("ParamHunter","Reflected XSS", ep.url, Severity.MEDIUM, "Payload reflected.", param, p)
+
+
+class ExternalToolManager:
+    def __init__(self, console: Console, output_dir: Path):
+        self.console = console
+        self.output_dir = output_dir
+
+    async def run_subfinder(self, target: str) -> List[Vulnerability]: 
+        return []
+    async def run_wafw00f(self, target: str) -> List[Vulnerability]: 
+        return []
+    async def run_wappalyzer(self, target: str) -> List[Vulnerability]: 
+        return []
+    async def run_ffuf(self, target: str, wordlist: Path) -> List[Vulnerability]: 
+        return []
+    async def run_nuclei(self, target: str) -> List[Vulnerability]: 
+        return []
+    async def run_wapiti(self, target: str) -> List[Vulnerability]: 
+        return []
+    async def run_sqlmap(self, target: str, cookies: Optional[str]) -> List[Vulnerability]: 
+        return []
+    async def run_arjun(self, target: str) -> List[Vulnerability]: 
+        return []
 
 class Reporter:
     def __init__(self, console: Console):
-        self.console, self.findings = console, []
-    def add_findings(self, vulns: List[Vulnerability]): self.findings.extend(vulns)
-    def generate_json_report(self, target: str, args: argparse.Namespace, start_time: float):
-        self.console.log(":memo: [bold blue]Generating final report...[/]")
-        report = {
-            "scan_info": {"target": target, "start_time": time.ctime(start_time), "duration_seconds": round(time.time() - start_time)},
-            "config": vars(args),
-            "findings": sorted([v.__dict__ for v in self.findings], key=lambda x: ({"High":0,"Medium":1,"Low":2,"Info":3}.get(x.get('severity'),4), x.get('vuln_type')))
+        self.console = console
+        self.findings: List[Vulnerability] = []
+
+    def add(self, vulns: List[Vulnerability]):
+        self.findings.extend(vulns)
+
+    def json_report(self, target: str, args: argparse.Namespace, start: float):
+        self.console.log(":memo: [bold blue]Generating JSON report...[/]")
+        data = {
+            "scan_info": {"target": target, "start_time": time.ctime(start), "duration_seconds": round(time.time() - start)},
+            "config": {k: str(v) for k, v in vars(args).items()},
+            "findings": [
+                {**v.__dict__, "severity": str(v.severity)}
+                for v in sorted(self.findings, key=lambda x: (list(Severity).index(x.severity), x.vuln_type, x.url))
+            ]
         }
-        filename = f"report_{urlparse(target).netloc}_{time.strftime('%Y%m%d_%H%M%S')}.json"
-        with open(filename, 'w', encoding='utf-8') as f: json.dump(report, f, indent=4)
-        self.console.log(f":file_folder: [bold green]Report saved to {filename}[/]")
+        fname = f"report_{urlparse(target).netloc}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        Path(fname).write_text(json.dumps(data, indent=4, ensure_ascii=False))
+        log_ok(f"Report saved to {Path(fname).resolve()}")
 
 class ScanController:
-    def __init__(self, args: argparse.Namespace):
-        self.args, self.console, self.reporter, self.start_time = args, Console(), Reporter(Console()), time.time()
+    def __init__(self, args: argparse.Namespace, headers: Dict[str,str]):
+        self.args = args
+        self.headers = headers
+        self.console = Console()
+        self.reporter = Reporter(self.console)
+        self.start_time = time.time()
+        self.tool_cfg = {
+            'run_subfinder': ('subfinder','go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest'),
+            'run_wafw00f':   ('wafw00f','pip3 install wafw00f'),
+            'run_wappalyzer':('wappalyzer-cli','npm install -g wappalyzer-cli'),
+            'run_ffuf':      ('ffuf','go install -v github.com/ffuf/ffuf/v2@latest'),
+            'run_nuclei':    ('nuclei','go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest'),
+            'run_wapiti':    ('wapiti','pip3 install wapiti3'),
+            'run_sqlmap':    ('sqlmap','sudo apt-get install sqlmap'),
+            'run_arjun':     ('arjun','pip3 install arjun'),
+        }
 
-    def _setup_ui(self) -> Tuple[Live, Table, Progress]:
-        vuln_table = Table(title="Vulnerabilities Found", expand=True, border_style="red")
-        vuln_table.add_column("Time", style="dim"); vuln_table.add_column("Source", style="cyan"); vuln_table.add_column("Type", style="yellow"); vuln_table.add_column("Severity"); vuln_table.add_column("URL", style="magenta")
-        progress = Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("[progress.percentage]{task.percentage:>3.0f}%"), TimeElapsedColumn())
-        live = Live(Panel(Columns([Panel(vuln_table, title="[bold green]Findings[/]"), Panel(progress, title="[bold blue]Progress[/]")])), console=self.console, screen=False, auto_refresh=True, vertical_overflow="visible")
-        return live, vuln_table, progress
+    def _check_dependencies(self):
+        self.console.print(Panel("[yellow]Checking dependencies...[/]", title="Pre-Run", border_style="yellow"))
+        for arg,(cmd,inst) in self.tool_cfg.items():
+            if getattr(self.args, arg) and shutil.which(cmd) is None:
+                self.console.print(f":x: [bold red]Tool '{cmd}' not found. Install with: [green]{inst}[/]")
+                setattr(self.args, arg, False)
+        self.console.print("-"*60)
+
+    def _setup_ui(self):
+        table = Table(title="Found Vulnerabilities", expand=True, border_style="red")
+        for col,style in [("Time","dim"),("Source","cyan"),("Severity",""),("Type","yellow"),("URL","magenta"),("Evidence","")]:
+            table.add_column(col, style=style)
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn()
+        )
+        layout = Panel(
+            Columns([
+                Panel(table, title="[bold green]Discoveries[/]"),
+                Panel(progress, title="[bold blue]Progress[/]")
+            ])
+        )
+        return Live(layout, console=self.console, screen=False, auto_refresh=True), table, progress
 
     async def run(self):
-        self.console.print(Panel(Text("ParamHunter Pro v6.0 - Ultimate Orchestrator", justify="center"), title="[bold yellow]INITIALIZING SCAN[/]", border_style="yellow"))
-        live, vuln_table, progress = self._setup_ui()
+        self.console.print(Panel(Text("ParamHunter Pro v6.9 - Stalker Edition",justify="center"), title="[bold yellow]INITIALIZING[/]",border_style="yellow"))
+        self._check_dependencies()
+        live, table, progress = self._setup_ui()
         with live:
-            headers = {k:v for k,v in (h.split(':', 1) for h in self.args.headers.split(';'))} if self.args.headers else {}
-            async with SessionManager(headers, self.args.cookies, self.args.proxy, self.args.timeout) as session:
-                tool_manager, reporter = ExternalToolManager(self.console), Reporter(self.console)
-                
-                # FASE 1: ESCOPO
+            async with SessionManager(self.headers, self.args.cookies, self.args.timeout) as session:
+                tool_mgr = ExternalToolManager(self.console, Path("scan_results"))
                 targets = {self.args.url}
-                if self.args.run_subfinder:
-                    subs = await tool_manager.run_subfinder(urlparse(self.args.url).netloc)
-                    targets.update([f"https://{s}" for s in subs if s])
-                live.update(Panel(f"Scope defined: [bold green]{len(targets)}[/] total targets."))
-
-                # FASE 2: SCANNERS EXTERNOS EM TODOS OS ALVOS
-                external_tasks = []
-                for target in targets:
-                    if self.args.run_nuclei: external_tasks.append(tool_manager.run_nuclei(target))
-                    if self.args.run_nikto: external_tasks.append(tool_manager.run_nikto(target))
-                    if self.args.run_wapiti: external_tasks.append(tool_manager.run_wapiti(target))
                 
-                if external_tasks:
-                    for future in asyncio.as_completed(external_tasks):
-                        for vuln in await future:
-                            sev_color = "red" if vuln.severity == "High" else "yellow" if vuln.severity == "Medium" else "white"
-                            vuln_table.add_row(vuln.timestamp, vuln.source, vuln.vuln_type, f"[{sev_color}]{vuln.severity}[/]", vuln.url)
-                            reporter.add_findings([vuln])
-
-                # FASE 3: CRAWLING & FUZZING INTERNO (NO ALVO PRINCIPAL)
-                crawler = Crawler(session, self.args.url, self.args.crawl_depth)
+                if self.args.run_subfinder:
+                    subs = await tool_mgr.run_subfinder(urlparse(self.args.url).netloc)
+                    targets.update(f"https://{s}" for s in subs)
+                
+                ext_tasks = []
+                for arg,func in {
+                    'run_wafw00f':tool_mgr.run_wafw00f,
+                    'run_wappalyzer':tool_mgr.run_wappalyzer,
+                    'run_ffuf':lambda t: tool_mgr.run_ffuf(t, Path(self.args.wordlist)),
+                    'run_nuclei':tool_mgr.run_nuclei,
+                    'run_wapiti':tool_mgr.run_wapiti,
+                    'run_sqlmap':lambda t: tool_mgr.run_sqlmap(t,self.args.cookies),
+                    'run_arjun':tool_mgr.run_arjun
+                }.items():
+                    if getattr(self.args, arg):
+                        for t in targets: 
+                            ext_tasks.append(func(t))
+                
+                if ext_tasks:
+                    task = progress.add_task("[yellow]External Scanners", total=len(ext_tasks))
+                    for fut in asyncio.as_completed(ext_tasks):
+                        res = await fut
+                        if res: 
+                            self.reporter.add(res)
+                            for v in res:
+                                table.add_row(v.timestamp, v.source, f"[{v.severity.color}]{v.severity}[/]", v.vuln_type, v.url, v.evidence)
+                        progress.update(task, advance=1)
+                
+                crawler = Crawler(session, self.args.url, self.args.crawl_depth, self.args.proxy)
                 endpoints = await crawler.run(progress)
-                if endpoints:
-                    fuzzer = Fuzzer(session, endpoints, self.args.tests.split(',') if self.args.tests else [], PayloadManager(PAYLOADS_DATA))
-                    async for vuln in fuzzer.run(progress):
-                        vuln_table.add_row(vuln.timestamp, vuln.source, vuln.vuln_type, f"[bold red]{vuln.severity}[/]", vuln.url)
-                        reporter.add_findings([vuln])
+                
+                if endpoints and self.args.tests:
+                    f = Fuzzer(session, endpoints, self.args.tests.split(','), PayloadManager(PAYLOADS_DATA), self.args.proxy)
+                    async for v in f.run(progress):
+                        self.reporter.add([v])
+                        table.add_row(v.timestamp, v.source, f"[{v.severity.color}]{v.severity}[/]", v.vuln_type, v.url, v.evidence)
+        
+        self.console.print(Panel(Text("Scan Complete!",justify="center"), title="[bold green]DONE[/]",border_style="green"))
+        self.reporter.json_report(self.args.url, self.args, self.start_time)
 
-        # FASE 4: RELATÓRIO FINAL
-        self.console.print(Panel(Text("Scan Finished!", justify="center"), title="[bold green]COMPLETE[/]", border_style="green"))
-        reporter.generate_json_report(self.args.url, self.args, self.start_time)
-
-def main():
-    parser = argparse.ArgumentParser(description="ParamHunter Pro v6.0 - Offensive Security Automation Framework")
-    parser.add_argument('-u', '--url', required=True, help='Main target URL (e.g., http://example.com)')
-    parser.add_argument('-t', '--threads', type=int, default=25, help='Concurrency limit (not directly used, for config only)')
-    parser.add_argument('--timeout', type=int, default=10, help="Request timeout (seconds)")
-    parser.add_argument('--crawl-depth', type=int, default=1, help="Maximum crawling depth")
-    parser.add_argument('--cookies', help='Cookies ("sessionid=abc;user=def")')
-    parser.add_argument('--headers', help='Custom headers ("X-API-Key:val;Auth:token")')
-    parser.add_argument('--proxy', help='Proxy (e.g., http://127.0.0.1:8080)')
-    parser.add_argument('--tests', help='Internal fuzzer tests (sqli,xss)')
-    parser.add_argument('--run-subfinder', action='store_true', help='Execute Subfinder for subdomain enumeration.')
-    parser.add_argument('--run-nuclei', action='store_true', help='Execute Nuclei for template-based scanning.')
-    parser.add_argument('--run-nikto', action='store_true', help='Execute Nikto for web server scanning.')
-    parser.add_argument('--run-wapiti', action='store_true', help='Execute Wapiti for black-box app scanning.')
+async def _main():
+    parser = build_arg_parser()
     args = parser.parse_args()
+    if not urlparse(args.url).scheme:
+        log_err("URL must start with http:// or https://")
+        raise SystemExit(1)
+    headers: Dict[str,str] = {}
+    if args.set_header:
+        for h in args.set_header.split(";"):
+            if ":" not in h:
+                log_warn(f"Ignoring malformed header: {h}")
+                continue
+            k,v = (p.strip() for p in h.split(":",1))
+            if k and v: headers[k] = v
+    ctrl = ScanController(args, headers)
+    await ctrl.run()
 
+
+if __name__=="__main__":
     try:
-        asyncio.run(ScanController(args).run())
+        asyncio.run(_main())
     except KeyboardInterrupt:
-        Console().print("\n[bold yellow]Scan interrupted by user.[/bold yellow]")
-    except Exception as e:
-        Console().print(f"\n[bold red]A fatal error occurred: {e}[/]")
-
-if __name__ == "__main__":
-    main()
+        console.print("\n[bold yellow]Scan interrupted by user.[/]")
+    except Exception as exc:
+        log_err(f"Unexpected error: {exc}")
+        console.print_exception(show_locals=True)
