@@ -222,7 +222,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/) - HTML parsing
 - Security community for vulnerability research and responsible disclosure
 
-## 👨‍💻 Author
+## Author
 
 **m2hcs** - Senior Offensive Security Engineer
 - 🐦 Twitter: [@inf0secc](https://twitter.com/inf0secc)
