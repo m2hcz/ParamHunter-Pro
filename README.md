@@ -53,9 +53,8 @@ Seamlessly integrate with industry-standard security tools:
 
 ### Quick Setup
 ```bash
-git clone https://github.com/yourusername/paramhunter-pro.git
-cd paramhunter-pro
-pip install -r requirements.txt
+git clone https://github.com/m2hcz/ParamHunter-Pro.git
+cd ParamHunter-Pro
 ```
 
 ### Dependencies
